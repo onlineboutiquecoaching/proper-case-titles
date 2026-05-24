@@ -79,9 +79,29 @@ function verifyShopifyWebhook(req) {
   );
 }
 
-async function updateProductTitle(productId, newTitle) {
-  const gid = `gid://shopify/Product/${productId}`;
+async function shopifyGraphQL(query, variables = {}) {
+  const response = await fetch(
+    `https://${process.env.SHOPIFY_SHOP}/admin/api/2026-04/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN
+      },
+      body: JSON.stringify({ query, variables })
+    }
+  );
 
+  const result = await response.json();
+
+  if (result.errors) {
+    console.error("GraphQL errors:", JSON.stringify(result.errors, null, 2));
+  }
+
+  return result;
+}
+
+async function updateProductTitle(productGid, newTitle) {
   const mutation = `
     mutation UpdateProductTitle($input: ProductInput!) {
       productUpdate(input: $input) {
@@ -97,31 +117,12 @@ async function updateProductTitle(productId, newTitle) {
     }
   `;
 
-  const response = await fetch(
-    `https://${process.env.SHOPIFY_SHOP}/admin/api/2026-04/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN
-      },
-      body: JSON.stringify({
-        query: mutation,
-        variables: {
-          input: {
-            id: gid,
-            title: newTitle
-          }
-        }
-      })
+  const result = await shopifyGraphQL(mutation, {
+    input: {
+      id: productGid,
+      title: newTitle
     }
-  );
-
-  const result = await response.json();
-
-  if (result.errors) {
-    console.error("GraphQL errors:", result.errors);
-  }
+  });
 
   if (result.data?.productUpdate?.userErrors?.length) {
     console.error("Shopify user errors:", result.data.productUpdate.userErrors);
@@ -129,6 +130,98 @@ async function updateProductTitle(productId, newTitle) {
 
   return result;
 }
+
+async function fixExistingProductTitles() {
+  let hasNextPage = true;
+  let cursor = null;
+
+  let scanned = 0;
+  let updated = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  const updatedProducts = [];
+
+  while (hasNextPage) {
+    const query = `
+      query GetProducts($cursor: String) {
+        products(first: 100, after: $cursor) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            node {
+              id
+              title
+            }
+          }
+        }
+      }
+    `;
+
+    const result = await shopifyGraphQL(query, { cursor });
+
+    const products = result.data?.products?.edges || [];
+
+    for (const edge of products) {
+      const product = edge.node;
+      scanned++;
+
+      const currentTitle = product.title;
+      const properTitle = toProperCase(currentTitle);
+
+      if (currentTitle === properTitle) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        await updateProductTitle(product.id, properTitle);
+        updated++;
+
+        updatedProducts.push({
+          oldTitle: currentTitle,
+          newTitle: properTitle
+        });
+      } catch (error) {
+        errors++;
+        console.error(`Failed to update ${currentTitle}:`, error);
+      }
+    }
+
+    hasNextPage = result.data?.products?.pageInfo?.hasNextPage || false;
+    cursor = result.data?.products?.pageInfo?.endCursor || null;
+  }
+
+  return {
+    scanned,
+    updated,
+    skipped,
+    errors,
+    updatedProducts
+  };
+}
+
+app.get("/api/run-proper-case", async (req, res) => {
+  try {
+    const secret = req.query.secret;
+
+    if (!process.env.RUN_SECRET || secret !== process.env.RUN_SECRET) {
+      return res.status(401).send("Unauthorized");
+    }
+
+    const result = await fixExistingProductTitles();
+
+    return res.status(200).json({
+      message: "Bulk title cleanup complete.",
+      ...result
+    });
+  } catch (error) {
+    console.error("Bulk cleanup error:", error);
+    return res.status(500).send("Bulk cleanup failed.");
+  }
+});
 
 app.post("/api/webhooks/products", async (req, res) => {
   try {
@@ -150,7 +243,9 @@ app.post("/api/webhooks/products", async (req, res) => {
       return res.status(200).send("Title already formatted");
     }
 
-    await updateProductTitle(product.id, properTitle);
+    const productGid = `gid://shopify/Product/${product.id}`;
+
+    await updateProductTitle(productGid, properTitle);
 
     return res.status(200).send(`Updated title to: ${properTitle}`);
   } catch (error) {
