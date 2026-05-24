@@ -6,10 +6,85 @@ dotenv.config();
 
 const app = express();
 
+const SHOPIFY_API_VERSION = "2026-04";
+
 app.get("/", (req, res) => {
   res.status(200).send("Proper Case Titles app is running.");
 });
 
+/**
+ * Gets a fresh Shopify Admin API access token using your Dev Dashboard app credentials.
+ * Requires these Render environment variables:
+ * - SHOPIFY_SHOP
+ * - SHOPIFY_API_KEY
+ * - SHOPIFY_API_SECRET
+ */
+let cachedAccessToken = null;
+let tokenExpiresAt = 0;
+
+async function getShopifyAccessToken() {
+  const now = Date.now();
+
+  if (cachedAccessToken && now < tokenExpiresAt - 60_000) {
+    return cachedAccessToken;
+  }
+
+  const response = await fetch(
+    `https://${process.env.SHOPIFY_SHOP}/admin/oauth/access_token`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        client_id: process.env.SHOPIFY_API_KEY,
+        client_secret: process.env.SHOPIFY_API_SECRET
+      })
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || !result.access_token) {
+    console.error("Token request failed:", JSON.stringify(result, null, 2));
+    throw new Error("Could not generate Shopify access token");
+  }
+
+  cachedAccessToken = result.access_token;
+  tokenExpiresAt = now + ((result.expires_in || 86400) * 1000);
+
+  return cachedAccessToken;
+}
+
+async function shopifyGraphQL(query, variables = {}) {
+  const accessToken = await getShopifyAccessToken();
+
+  const response = await fetch(
+    `https://${process.env.SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": accessToken
+      },
+      body: JSON.stringify({ query, variables })
+    }
+  );
+
+  const result = await response.json();
+
+  if (result.errors) {
+    console.error("GraphQL errors:", JSON.stringify(result.errors, null, 2));
+  }
+
+  return result;
+}
+
+/**
+ * Test route.
+ * After deploy, visit:
+ * https://proper-case-titles.onrender.com/api/test-shopify
+ */
 app.get("/api/test-shopify", async (req, res) => {
   try {
     const query = `
@@ -29,26 +104,17 @@ app.get("/api/test-shopify", async (req, res) => {
       }
     `;
 
-    const response = await fetch(
-      `https://${process.env.SHOPIFY_SHOP}/admin/api/2026-04/graphql.json`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN
-        },
-        body: JSON.stringify({ query })
-      }
-    );
-
-    const result = await response.json();
+    const result = await shopifyGraphQL(query);
 
     return res.status(200).json({
       shopEnv: process.env.SHOPIFY_SHOP,
-      hasToken: Boolean(process.env.SHOPIFY_ADMIN_ACCESS_TOKEN),
+      hasApiKey: Boolean(process.env.SHOPIFY_API_KEY),
+      hasApiSecret: Boolean(process.env.SHOPIFY_API_SECRET),
       result
     });
   } catch (error) {
+    console.error("Shopify test error:", error);
+
     return res.status(500).json({
       error: "Shopify test failed",
       details: error.message
@@ -56,6 +122,10 @@ app.get("/api/test-shopify", async (req, res) => {
   }
 });
 
+/**
+ * Webhook raw body parser.
+ * This must stay BEFORE the webhook route.
+ */
 app.use(
   "/api/webhooks/products",
   express.raw({ type: "application/json" })
@@ -119,38 +189,20 @@ function verifyShopifyWebhook(req) {
     .update(req.body)
     .digest("base64");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(digest, "utf8"),
-    Buffer.from(hmacHeader, "utf8")
-  );
-}
+  const digestBuffer = Buffer.from(digest, "utf8");
+  const hmacBuffer = Buffer.from(hmacHeader, "utf8");
 
-async function shopifyGraphQL(query, variables = {}) {
-  const response = await fetch(
-    `https://${process.env.SHOPIFY_SHOP}/admin/api/2026-04/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN
-      },
-      body: JSON.stringify({ query, variables })
-    }
-  );
-
-  const result = await response.json();
-
-  if (result.errors) {
-    console.error("GraphQL errors:", JSON.stringify(result.errors, null, 2));
+  if (digestBuffer.length !== hmacBuffer.length) {
+    return false;
   }
 
-  return result;
+  return crypto.timingSafeEqual(digestBuffer, hmacBuffer);
 }
 
 async function updateProductTitle(productGid, newTitle) {
   const mutation = `
-    mutation UpdateProductTitle($input: ProductInput!) {
-      productUpdate(input: $input) {
+    mutation UpdateProductTitle($product: ProductUpdateInput!) {
+      productUpdate(product: $product) {
         product {
           id
           title
@@ -164,14 +216,17 @@ async function updateProductTitle(productGid, newTitle) {
   `;
 
   const result = await shopifyGraphQL(mutation, {
-    input: {
+    product: {
       id: productGid,
       title: newTitle
     }
   });
 
   if (result.data?.productUpdate?.userErrors?.length) {
-    console.error("Shopify user errors:", result.data.productUpdate.userErrors);
+    console.error(
+      "Shopify user errors:",
+      JSON.stringify(result.data.productUpdate.userErrors, null, 2)
+    );
   }
 
   return result;
@@ -208,6 +263,11 @@ async function fixExistingProductTitles() {
 
     const result = await shopifyGraphQL(query, { cursor });
 
+    if (result.errors) {
+      errors++;
+      break;
+    }
+
     const products = result.data?.products?.edges || [];
 
     for (const edge of products) {
@@ -223,10 +283,19 @@ async function fixExistingProductTitles() {
       }
 
       try {
-        await updateProductTitle(product.id, properTitle);
+        const updateResult = await updateProductTitle(product.id, properTitle);
+
+        const userErrors = updateResult.data?.productUpdate?.userErrors || [];
+
+        if (userErrors.length) {
+          errors++;
+          continue;
+        }
+
         updated++;
 
         updatedProducts.push({
+          id: product.id,
           oldTitle: currentTitle,
           newTitle: properTitle
         });
@@ -249,6 +318,11 @@ async function fixExistingProductTitles() {
   };
 }
 
+/**
+ * Bulk run route.
+ * After deploy, visit:
+ * https://proper-case-titles.onrender.com/api/run-proper-case?secret=fix-my-titles
+ */
 app.get("/api/run-proper-case", async (req, res) => {
   try {
     const secret = req.query.secret;
@@ -265,10 +339,17 @@ app.get("/api/run-proper-case", async (req, res) => {
     });
   } catch (error) {
     console.error("Bulk cleanup error:", error);
-    return res.status(500).send("Bulk cleanup failed.");
+
+    return res.status(500).json({
+      error: "Bulk cleanup failed.",
+      details: error.message
+    });
   }
 });
 
+/**
+ * Webhook route for future product creates/updates.
+ */
 app.post("/api/webhooks/products", async (req, res) => {
   try {
     if (!verifyShopifyWebhook(req)) {
@@ -296,6 +377,7 @@ app.post("/api/webhooks/products", async (req, res) => {
     return res.status(200).send(`Updated title to: ${properTitle}`);
   } catch (error) {
     console.error("Webhook error:", error);
+
     return res.status(500).send("Webhook failed");
   }
 });
