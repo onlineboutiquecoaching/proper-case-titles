@@ -14,10 +14,13 @@ app.get("/", (req, res) => {
 
 /**
  * Gets a fresh Shopify Admin API access token using your Dev Dashboard app credentials.
- * Requires these Render environment variables:
- * - SHOPIFY_SHOP
- * - SHOPIFY_API_KEY
- * - SHOPIFY_API_SECRET
+ *
+ * Required Render environment variables:
+ * - SHOPIFY_SHOP = knitted-belle.myshopify.com
+ * - SHOPIFY_API_KEY = Client ID from Shopify Dev Dashboard
+ * - SHOPIFY_API_SECRET = Secret from Shopify Dev Dashboard
+ * - RUN_SECRET = fix-my-titles
+ * - SHOPIFY_WEBHOOK_SECRET = Secret from Shopify Dev Dashboard
  */
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
@@ -29,25 +32,42 @@ async function getShopifyAccessToken() {
     return cachedAccessToken;
   }
 
+  const body = new URLSearchParams();
+  body.append("grant_type", "client_credentials");
+  body.append("client_id", process.env.SHOPIFY_API_KEY || "");
+  body.append("client_secret", process.env.SHOPIFY_API_SECRET || "");
+
   const response = await fetch(
     `https://${process.env.SHOPIFY_SHOP}/admin/oauth/access_token`,
     {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json"
       },
-      body: JSON.stringify({
-        client_id: process.env.SHOPIFY_API_KEY,
-        client_secret: process.env.SHOPIFY_API_SECRET
-      })
+      body
     }
   );
 
-  const result = await response.json();
+  const text = await response.text();
+
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch (error) {
+    console.error("Shopify returned non-JSON response:", text.slice(0, 1000));
+    throw new Error(
+      `Shopify token request returned non-JSON. Status: ${response.status}. Check SHOPIFY_SHOP, SHOPIFY_API_KEY, and SHOPIFY_API_SECRET.`
+    );
+  }
 
   if (!response.ok || !result.access_token) {
     console.error("Token request failed:", JSON.stringify(result, null, 2));
-    throw new Error("Could not generate Shopify access token");
+    throw new Error(
+      result.error_description ||
+        result.error ||
+        "Could not generate Shopify access token"
+    );
   }
 
   cachedAccessToken = result.access_token;
@@ -71,7 +91,17 @@ async function shopifyGraphQL(query, variables = {}) {
     }
   );
 
-  const result = await response.json();
+  const text = await response.text();
+
+  let result;
+  try {
+    result = JSON.parse(text);
+  } catch (error) {
+    console.error("Shopify GraphQL returned non-JSON response:", text.slice(0, 1000));
+    throw new Error(
+      `Shopify GraphQL request returned non-JSON. Status: ${response.status}.`
+    );
+  }
 
   if (result.errors) {
     console.error("GraphQL errors:", JSON.stringify(result.errors, null, 2));
@@ -132,13 +162,46 @@ app.use(
 );
 
 const KEEP_UPPERCASE = new Set([
-  "USA", "US", "UK", "XL", "XS", "XXL", "XXXL", "2XL", "3XL", "4XL",
-  "SKU", "POD", "SEO", "VIP", "CEO", "B2B", "B2C"
+  "USA",
+  "US",
+  "UK",
+  "XL",
+  "XS",
+  "XXL",
+  "XXXL",
+  "2XL",
+  "3XL",
+  "4XL",
+  "SKU",
+  "POD",
+  "SEO",
+  "VIP",
+  "CEO",
+  "B2B",
+  "B2C"
 ]);
 
 const SMALL_WORDS = new Set([
-  "a", "an", "and", "as", "at", "but", "by", "for", "from",
-  "in", "into", "nor", "of", "on", "or", "per", "the", "to", "vs", "with"
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "but",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "nor",
+  "of",
+  "on",
+  "or",
+  "per",
+  "the",
+  "to",
+  "vs",
+  "with"
 ]);
 
 function titleCaseWord(word, index, totalWords) {
