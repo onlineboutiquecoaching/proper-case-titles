@@ -170,7 +170,7 @@ app.get("/auth/callback", async (req, res) => {
 
       <p>Then run:</p>
 
-      <pre>${APP_URL}/api/run-proper-case?secret=${process.env.RUN_SECRET}</pre>
+      <pre>${APP_URL}/api/run-proper-case?secret=${process.env.RUN_SECRET}&batchSize=50</pre>
     `);
   } catch (error) {
     console.error("OAuth callback error:", error);
@@ -391,10 +391,7 @@ async function updateProductTitle(productGid, newTitle) {
   return result;
 }
 
-async function fixExistingProductTitles() {
-  let hasNextPage = true;
-  let cursor = null;
-
+async function fixExistingProductTitlesBatch(cursor = null, batchSize = 50) {
   let scanned = 0;
   let updated = 0;
   let skipped = 0;
@@ -402,77 +399,100 @@ async function fixExistingProductTitles() {
 
   const updatedProducts = [];
 
-  while (hasNextPage) {
-    const query = `
-      query GetProducts($cursor: String) {
-        products(first: 100, after: $cursor) {
-          pageInfo {
-            hasNextPage
-            endCursor
-          }
-          edges {
-            node {
-              id
-              title
-            }
+  const query = `
+    query GetProducts($cursor: String, $batchSize: Int!) {
+      products(first: $batchSize, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        edges {
+          node {
+            id
+            title
           }
         }
       }
-    `;
+    }
+  `;
 
-    const result = await shopifyGraphQL(query, { cursor });
+  const result = await shopifyGraphQL(query, {
+    cursor,
+    batchSize
+  });
 
-    if (result.errors) {
-      errors++;
-      break;
+  if (result.errors) {
+    return {
+      scanned,
+      updated,
+      skipped,
+      errors: errors + 1,
+      hasNextPage: false,
+      nextCursor: null,
+      updatedProducts,
+      shopifyErrors: result.errors
+    };
+  }
+
+  const products = result.data?.products?.edges || [];
+
+  for (const edge of products) {
+    const product = edge.node;
+    scanned++;
+
+    const currentTitle = product.title;
+    const properTitle = toProperCase(currentTitle);
+
+    if (currentTitle === properTitle) {
+      skipped++;
+      continue;
     }
 
-    const products = result.data?.products?.edges || [];
+    try {
+      const updateResult = await updateProductTitle(product.id, properTitle);
 
-    for (const edge of products) {
-      const product = edge.node;
-      scanned++;
+      const userErrors = updateResult.data?.productUpdate?.userErrors || [];
 
-      const currentTitle = product.title;
-      const properTitle = toProperCase(currentTitle);
-
-      if (currentTitle === properTitle) {
-        skipped++;
-        continue;
-      }
-
-      try {
-        const updateResult = await updateProductTitle(product.id, properTitle);
-
-        const userErrors = updateResult.data?.productUpdate?.userErrors || [];
-
-        if (userErrors.length) {
-          errors++;
-          continue;
-        }
-
-        updated++;
-
+      if (userErrors.length) {
+        errors++;
         updatedProducts.push({
           id: product.id,
           oldTitle: currentTitle,
-          newTitle: properTitle
+          attemptedTitle: properTitle,
+          errors: userErrors
         });
-      } catch (error) {
-        errors++;
-        console.error(`Failed to update ${currentTitle}:`, error);
+        continue;
       }
-    }
 
-    hasNextPage = result.data?.products?.pageInfo?.hasNextPage || false;
-    cursor = result.data?.products?.pageInfo?.endCursor || null;
+      updated++;
+
+      updatedProducts.push({
+        id: product.id,
+        oldTitle: currentTitle,
+        newTitle: properTitle
+      });
+    } catch (error) {
+      errors++;
+      console.error(`Failed to update ${currentTitle}:`, error);
+
+      updatedProducts.push({
+        id: product.id,
+        oldTitle: currentTitle,
+        attemptedTitle: properTitle,
+        error: error.message
+      });
+    }
   }
+
+  const pageInfo = result.data?.products?.pageInfo || {};
 
   return {
     scanned,
     updated,
     skipped,
     errors,
+    hasNextPage: Boolean(pageInfo.hasNextPage),
+    nextCursor: pageInfo.endCursor || null,
     updatedProducts
   };
 }
@@ -485,17 +505,100 @@ app.get("/api/run-proper-case", async (req, res) => {
       return res.status(401).send("Unauthorized");
     }
 
-    const result = await fixExistingProductTitles();
+    const cursor = req.query.cursor || null;
+    const batchSize = Math.min(Number(req.query.batchSize || 50), 100);
+
+    const result = await fixExistingProductTitlesBatch(cursor, batchSize);
+
+    const nextUrl = result.hasNextPage
+      ? `${APP_URL}/api/run-proper-case?secret=${encodeURIComponent(
+          process.env.RUN_SECRET
+        )}&batchSize=${batchSize}&cursor=${encodeURIComponent(result.nextCursor)}`
+      : null;
 
     return res.status(200).json({
-      message: "Bulk title cleanup complete.",
-      ...result
+      message: result.hasNextPage
+        ? "Batch complete. More products remain. Open the nextUrl to continue."
+        : "Bulk title cleanup complete. No more products remain.",
+      batchSize,
+      ...result,
+      nextUrl
     });
   } catch (error) {
     console.error("Bulk cleanup error:", error);
 
     return res.status(500).json({
       error: "Bulk cleanup failed.",
+      details: error.message
+    });
+  }
+});
+
+app.get("/api/register-webhooks", async (req, res) => {
+  try {
+    const secret = req.query.secret;
+
+    if (!process.env.RUN_SECRET || secret !== process.env.RUN_SECRET) {
+      return res.status(401).send("Unauthorized");
+    }
+
+    const callbackUrl = `${APP_URL}/api/webhooks/products`;
+
+    const mutation = `
+      mutation WebhookSubscriptionCreate(
+        $topic: WebhookSubscriptionTopic!
+        $webhookSubscription: WebhookSubscriptionInput!
+      ) {
+        webhookSubscriptionCreate(
+          topic: $topic
+          webhookSubscription: $webhookSubscription
+        ) {
+          webhookSubscription {
+            id
+            topic
+            endpoint {
+              __typename
+              ... on WebhookHttpEndpoint {
+                callbackUrl
+              }
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const topics = ["PRODUCTS_CREATE", "PRODUCTS_UPDATE"];
+    const results = [];
+
+    for (const topic of topics) {
+      const result = await shopifyGraphQL(mutation, {
+        topic,
+        webhookSubscription: {
+          callbackUrl,
+          format: "JSON"
+        }
+      });
+
+      results.push({
+        topic,
+        result
+      });
+    }
+
+    return res.status(200).json({
+      message: "Webhook registration attempted.",
+      callbackUrl,
+      results
+    });
+  } catch (error) {
+    console.error("Webhook registration error:", error);
+
+    return res.status(500).json({
+      error: "Webhook registration failed.",
       details: error.message
     });
   }
