@@ -10,6 +10,52 @@ app.get("/", (req, res) => {
   res.status(200).send("Proper Case Titles app is running.");
 });
 
+app.get("/api/test-shopify", async (req, res) => {
+  try {
+    const query = `
+      query {
+        shop {
+          name
+          myshopifyDomain
+        }
+        products(first: 5) {
+          edges {
+            node {
+              id
+              title
+            }
+          }
+        }
+      }
+    `;
+
+    const response = await fetch(
+      `https://${process.env.SHOPIFY_SHOP}/admin/api/2026-04/graphql.json`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN
+        },
+        body: JSON.stringify({ query })
+      }
+    );
+
+    const result = await response.json();
+
+    return res.status(200).json({
+      shopEnv: process.env.SHOPIFY_SHOP,
+      hasToken: Boolean(process.env.SHOPIFY_ADMIN_ACCESS_TOKEN),
+      result
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: "Shopify test failed",
+      details: error.message
+    });
+  }
+});
+
 app.use(
   "/api/webhooks/products",
   express.raw({ type: "application/json" })
