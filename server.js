@@ -7,77 +7,185 @@ dotenv.config();
 const app = express();
 
 const SHOPIFY_API_VERSION = "2026-04";
+const SCOPES = "read_products,write_products";
+const APP_URL = "https://proper-case-titles.onrender.com";
+
+const oauthStates = new Set();
 
 app.get("/", (req, res) => {
-  res.status(200).send("Proper Case Titles app is running.");
+  res.status(200).send(`
+    <h1>Proper Case Titles app is running.</h1>
+    <p>To authorize the app, visit:</p>
+    <p><a href="/auth?shop=${process.env.SHOPIFY_SHOP}">/auth?shop=${process.env.SHOPIFY_SHOP}</a></p>
+  `);
+});
+
+function normalizeShop(shop) {
+  if (!shop) return "";
+
+  return shop
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "")
+    .trim()
+    .toLowerCase();
+}
+
+function isValidShop(shop) {
+  return /^[a-zA-Z0-9][a-zA-Z0-9-]*\.myshopify\.com$/.test(shop);
+}
+
+function verifyOAuthHmac(query) {
+  const { hmac, signature, ...rest } = query;
+
+  if (!hmac) return false;
+
+  const message = Object.keys(rest)
+    .sort()
+    .map((key) => {
+      const value = Array.isArray(rest[key]) ? rest[key].join(",") : rest[key];
+      return `${key}=${value}`;
+    })
+    .join("&");
+
+  const generatedHash = crypto
+    .createHmac("sha256", process.env.SHOPIFY_API_SECRET)
+    .update(message)
+    .digest("hex");
+
+  const hmacBuffer = Buffer.from(hmac, "utf8");
+  const generatedBuffer = Buffer.from(generatedHash, "utf8");
+
+  if (hmacBuffer.length !== generatedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(hmacBuffer, generatedBuffer);
+}
+
+/**
+ * Start OAuth install/authorization.
+ * Visit:
+ * https://proper-case-titles.onrender.com/auth?shop=knitted-belle.myshopify.com
+ */
+app.get("/auth", (req, res) => {
+  const shop = normalizeShop(req.query.shop || process.env.SHOPIFY_SHOP);
+
+  if (!isValidShop(shop)) {
+    return res.status(400).send("Invalid shop domain.");
+  }
+
+  const state = crypto.randomBytes(16).toString("hex");
+  oauthStates.add(state);
+
+  const redirectUri = `${APP_URL}/auth/callback`;
+
+  const installUrl =
+    `https://${shop}/admin/oauth/authorize?` +
+    new URLSearchParams({
+      client_id: process.env.SHOPIFY_API_KEY,
+      scope: SCOPES,
+      redirect_uri: redirectUri,
+      state
+    }).toString();
+
+  return res.redirect(installUrl);
 });
 
 /**
- * Gets a fresh Shopify Admin API access token using your Dev Dashboard app credentials.
- *
- * Required Render environment variables:
- * - SHOPIFY_SHOP = knitted-belle.myshopify.com
- * - SHOPIFY_API_KEY = Client ID from Shopify Dev Dashboard
- * - SHOPIFY_API_SECRET = Secret from Shopify Dev Dashboard
- * - RUN_SECRET = fix-my-titles
- * - SHOPIFY_WEBHOOK_SECRET = Secret from Shopify Dev Dashboard
+ * OAuth callback.
+ * Shopify sends us a temporary code here.
+ * We exchange it for the Admin API access token.
  */
-let cachedAccessToken = null;
-let tokenExpiresAt = 0;
+app.get("/auth/callback", async (req, res) => {
+  try {
+    const shop = normalizeShop(req.query.shop);
+    const code = req.query.code;
+    const state = req.query.state;
 
-async function getShopifyAccessToken() {
-  const now = Date.now();
+    if (!isValidShop(shop)) {
+      return res.status(400).send("Invalid shop.");
+    }
 
-  if (cachedAccessToken && now < tokenExpiresAt - 60_000) {
-    return cachedAccessToken;
-  }
+    if (!code) {
+      return res.status(400).send("Missing OAuth code.");
+    }
 
-  const body = new URLSearchParams();
-  body.append("grant_type", "client_credentials");
-  body.append("client_id", process.env.SHOPIFY_API_KEY || "");
-  body.append("client_secret", process.env.SHOPIFY_API_SECRET || "");
+    if (!state || !oauthStates.has(state)) {
+      return res.status(400).send("Invalid OAuth state. Start again from /auth.");
+    }
 
-  const response = await fetch(
-    `https://${process.env.SHOPIFY_SHOP}/admin/oauth/access_token`,
-    {
+    oauthStates.delete(state);
+
+    if (!verifyOAuthHmac(req.query)) {
+      return res.status(400).send("Invalid OAuth HMAC.");
+    }
+
+    const tokenResponse = await fetch(`https://${shop}/admin/oauth/access_token`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Type": "application/json",
         Accept: "application/json"
       },
-      body
+      body: JSON.stringify({
+        client_id: process.env.SHOPIFY_API_KEY,
+        client_secret: process.env.SHOPIFY_API_SECRET,
+        code
+      })
+    });
+
+    const text = await tokenResponse.text();
+
+    let tokenResult;
+    try {
+      tokenResult = JSON.parse(text);
+    } catch (error) {
+      return res.status(500).send(`
+        <h1>Token exchange failed</h1>
+        <p>Shopify did not return JSON.</p>
+        <pre>${text.slice(0, 1000)}</pre>
+      `);
     }
-  );
 
-  const text = await response.text();
+    if (!tokenResponse.ok || !tokenResult.access_token) {
+      return res.status(500).send(`
+        <h1>Token exchange failed</h1>
+        <pre>${JSON.stringify(tokenResult, null, 2)}</pre>
+      `);
+    }
 
-  let result;
-  try {
-    result = JSON.parse(text);
+    return res.status(200).send(`
+      <h1>Success — copy this token into Render</h1>
+
+      <p>Go to Render → proper-case-titles → Environment.</p>
+
+      <p>Set this variable:</p>
+
+      <pre>SHOPIFY_ADMIN_ACCESS_TOKEN=${tokenResult.access_token}</pre>
+
+      <p>Then click Save, rebuild and deploy.</p>
+
+      <p>After Render redeploys, test:</p>
+
+      <pre>${APP_URL}/api/test-shopify</pre>
+
+      <p>Then run:</p>
+
+      <pre>${APP_URL}/api/run-proper-case?secret=${process.env.RUN_SECRET}</pre>
+    `);
   } catch (error) {
-    console.error("Shopify returned non-JSON response:", text.slice(0, 1000));
-    throw new Error(
-      `Shopify token request returned non-JSON. Status: ${response.status}. Check SHOPIFY_SHOP, SHOPIFY_API_KEY, and SHOPIFY_API_SECRET.`
-    );
+    console.error("OAuth callback error:", error);
+
+    return res.status(500).send(`
+      <h1>OAuth callback failed</h1>
+      <pre>${error.message}</pre>
+    `);
   }
-
-  if (!response.ok || !result.access_token) {
-    console.error("Token request failed:", JSON.stringify(result, null, 2));
-    throw new Error(
-      result.error_description ||
-        result.error ||
-        "Could not generate Shopify access token"
-    );
-  }
-
-  cachedAccessToken = result.access_token;
-  tokenExpiresAt = now + ((result.expires_in || 86400) * 1000);
-
-  return cachedAccessToken;
-}
+});
 
 async function shopifyGraphQL(query, variables = {}) {
-  const accessToken = await getShopifyAccessToken();
+  if (!process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || process.env.SHOPIFY_ADMIN_ACCESS_TOKEN === "unused") {
+    throw new Error("Missing SHOPIFY_ADMIN_ACCESS_TOKEN. Go through /auth first and paste the token into Render.");
+  }
 
   const response = await fetch(
     `https://${process.env.SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
@@ -85,7 +193,7 @@ async function shopifyGraphQL(query, variables = {}) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "X-Shopify-Access-Token": accessToken
+        "X-Shopify-Access-Token": process.env.SHOPIFY_ADMIN_ACCESS_TOKEN
       },
       body: JSON.stringify({ query, variables })
     }
@@ -98,9 +206,7 @@ async function shopifyGraphQL(query, variables = {}) {
     result = JSON.parse(text);
   } catch (error) {
     console.error("Shopify GraphQL returned non-JSON response:", text.slice(0, 1000));
-    throw new Error(
-      `Shopify GraphQL request returned non-JSON. Status: ${response.status}.`
-    );
+    throw new Error(`Shopify GraphQL request returned non-JSON. Status: ${response.status}.`);
   }
 
   if (result.errors) {
@@ -110,11 +216,6 @@ async function shopifyGraphQL(query, variables = {}) {
   return result;
 }
 
-/**
- * Test route.
- * After deploy, visit:
- * https://proper-case-titles.onrender.com/api/test-shopify
- */
 app.get("/api/test-shopify", async (req, res) => {
   try {
     const query = `
@@ -138,8 +239,7 @@ app.get("/api/test-shopify", async (req, res) => {
 
     return res.status(200).json({
       shopEnv: process.env.SHOPIFY_SHOP,
-      hasApiKey: Boolean(process.env.SHOPIFY_API_KEY),
-      hasApiSecret: Boolean(process.env.SHOPIFY_API_SECRET),
+      hasAdminToken: Boolean(process.env.SHOPIFY_ADMIN_ACCESS_TOKEN),
       result
     });
   } catch (error) {
@@ -152,10 +252,6 @@ app.get("/api/test-shopify", async (req, res) => {
   }
 });
 
-/**
- * Webhook raw body parser.
- * This must stay BEFORE the webhook route.
- */
 app.use(
   "/api/webhooks/products",
   express.raw({ type: "application/json" })
@@ -381,11 +477,6 @@ async function fixExistingProductTitles() {
   };
 }
 
-/**
- * Bulk run route.
- * After deploy, visit:
- * https://proper-case-titles.onrender.com/api/run-proper-case?secret=fix-my-titles
- */
 app.get("/api/run-proper-case", async (req, res) => {
   try {
     const secret = req.query.secret;
@@ -410,9 +501,6 @@ app.get("/api/run-proper-case", async (req, res) => {
   }
 });
 
-/**
- * Webhook route for future product creates/updates.
- */
 app.post("/api/webhooks/products", async (req, res) => {
   try {
     if (!verifyShopifyWebhook(req)) {
